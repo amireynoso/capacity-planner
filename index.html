@@ -1,0 +1,812 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Capacity Planner</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50">
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback, useMemo, useRef } = React;
+
+const STORAGE_KEY = "cap-planner-local";
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+function addDays(str, n) {
+  const d = new Date(str + "T12:00:00Z");
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+function genSprints(start, n) {
+  const out = []; let s = start;
+  for (let i = 0; i < n; i++) {
+    const e = addDays(s, 11);
+    out.push({ id: `sp${i+1}`, label: `S${i+1}`, start: s, end: e });
+    s = addDays(e, 3);
+  }
+  return out;
+}
+function overlaps(s1, e1, s2, e2) { return !!s1 && !!e1 && !!s2 && !!e2 && s1 <= e2 && s2 <= e1; }
+function fmtDate(d) { return new Date(d + "T12:00:00Z").toLocaleDateString("en-US", { month: "short", day: "numeric" }); }
+function sprintMonth(sp) { return new Date(sp.start + "T12:00:00Z").toLocaleDateString("en-US", { month: "long", year: "numeric" }); }
+function countBusinessDays(start, end) {
+  let count = 0;
+  const d = new Date(start + "T12:00:00Z"), e = new Date(end + "T12:00:00Z");
+  while (d <= e) { const day = d.getUTCDay(); if (day !== 0 && day !== 6) count++; d.setUTCDate(d.getUTCDate() + 1); }
+  return count || 10;
+}
+
+const PencilIcon = () => (
+  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+  </svg>
+);
+
+const RAG = { green: "#22c55e", amber: "#f59e0b", red: "#ef4444" };
+const uid = () => `u${Date.now().toString(36)}_${Math.random().toString(36).slice(2,6)}`;
+const REASONS = ["PTO", "Sick", "On-call", "On leave", "Other"];
+
+const INIT_TEAM = [
+  { id: "p1", name: "Person 1", velocity: 10 },
+  { id: "p2", name: "Person 2", velocity: 8 },
+];
+const INIT_SPRINTS = genSprints(new Date().toISOString().slice(0,7) + "-01", 8);
+
+// ── localStorage persistence ───────────────────────────────────────────────────
+function loadState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+function saveState(data) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch {}
+}
+
+// ── App ────────────────────────────────────────────────────────────────────────
+function App() {
+  const [tab, setTab]               = useState("gantt");
+  const [team, setTeam]             = useState(INIT_TEAM);
+  const [projects, setProjects]     = useState([]);
+  const [events, setEvents]         = useState([]);
+  const [assignments, setAsn]       = useState([]);
+  const [capOv, setCapOvState]      = useState({});
+  const [capReasons, setCapReasons] = useState({});
+  const [sprints, setSprints]       = useState(INIT_SPRINTS);
+  const [genStart, setGenStart]     = useState(INIT_SPRINTS[0].start);
+  const [genN, setGenN]             = useState(8);
+  const [expanded, setExpanded]     = useState({});
+  const [loaded, setLoaded]         = useState(false);
+
+  // Load from localStorage on mount
+  useEffect(() => {
+    const d = loadState();
+    if (d) {
+      if (d.team)        setTeam(d.team);
+      if (d.projects)    setProjects(d.projects);
+      if (d.events)      setEvents(d.events);
+      if (d.assignments) setAsn(d.assignments);
+      if (d.capOv)       setCapOvState(d.capOv);
+      if (d.capReasons)  setCapReasons(d.capReasons);
+      if (d.sprints)     setSprints(d.sprints);
+      if (d.genStart)    setGenStart(d.genStart);
+      if (d.genN)        setGenN(d.genN);
+    }
+    setLoaded(true);
+  }, []);
+
+  // Save to localStorage on every change
+  useEffect(() => {
+    if (!loaded) return;
+    saveState({ team, projects, events, assignments, capOv, capReasons, sprints, genStart, genN });
+  }, [team, projects, events, assignments, capOv, capReasons, sprints, genStart, genN, loaded]);
+
+  const effCap = useCallback((pid, sp) => {
+    let cap = capOv[`${pid}|${sp.id}`] ?? 100;
+    for (const ev of events) {
+      if (overlaps(ev.start, ev.end, sp.start, sp.end)) {
+        const os = ev.start > sp.start ? ev.start : sp.start;
+        const oe = ev.end < sp.end ? ev.end : sp.end;
+        const days = Math.max(1, (new Date(oe) - new Date(os)) / 86400000 + 1);
+        cap = cap * (1 - Math.min(days / 10, 1) * ev.impact / 100);
+      }
+    }
+    return Math.round(Math.max(0, cap));
+  }, [capOv, events]);
+
+  const activeAlloc = useCallback((personId, projectId, sp) => {
+    const spIdx = sprints.findIndex(s => s.id === sp.id);
+    const eligible = assignments
+      .filter(a => a.personId === personId && a.projectId === projectId)
+      .filter(a => sprints.findIndex(s => s.id === (a.fromSprintId || sprints[0]?.id)) <= spIdx);
+    if (!eligible.length) return 0;
+    eligible.sort((a, b) => sprints.findIndex(s => s.id === (b.fromSprintId || sprints[0]?.id)) - sprints.findIndex(s => s.id === (a.fromSprintId || sprints[0]?.id)));
+    return eligible[0].pct;
+  }, [assignments, sprints]);
+
+  const pPts    = useCallback((pid, sp) => { const p = team.find(t => t.id === pid); if (!p) return 0; return Math.round(p.velocity * effCap(pid, sp) / 100 * 10) / 10; }, [team, effCap]);
+  const projPts = useCallback((projId, sp) => { const people = [...new Set(assignments.filter(a => a.projectId === projId).map(a => a.personId))]; return people.reduce((s, pid) => s + Math.round(pPts(pid, sp) * activeAlloc(pid, projId, sp) / 100 * 10) / 10, 0); }, [assignments, activeAlloc, pPts]);
+  const teamPts = useCallback((sp) => team.reduce((s, p) => s + pPts(p.id, sp), 0), [team, pPts]);
+
+  const rag = useCallback((proj, sp) => {
+    if (!overlaps(proj.start || "2000-01-01", proj.end || "2099-12-31", sp.start, sp.end)) return null;
+    if (proj.ragOverride) return proj.ragOverride;
+    const people = [...new Set(assignments.filter(a => a.projectId === proj.id).map(a => a.personId))];
+    if (!people.length) return "amber";
+    const avgEff = people.reduce((s, pid) => s + effCap(pid, sp) * activeAlloc(pid, proj.id, sp) / 100, 0) / people.length;
+    if (avgEff >= 70) return "green";
+    if (avgEff >= 35) return "amber";
+    return "red";
+  }, [assignments, activeAlloc, effCap]);
+
+  const monthGroups   = useMemo(() => { const g = []; for (const sp of sprints) { const m = sprintMonth(sp); const last = g[g.length-1]; last?.label === m ? last.count++ : g.push({ label: m, count: 1 }); } return g; }, [sprints]);
+  const quarterGroups = useMemo(() => { const g = []; for (const sp of sprints) { const mo = new Date(sp.start+"T12:00:00Z").getUTCMonth(), yr = new Date(sp.start+"T12:00:00Z").getUTCFullYear(), q = `Q${Math.floor(mo/3)+1} ${yr}`; const last = g[g.length-1]; last?.label === q ? last.count++ : g.push({ label: q, count: 1 }); } return g; }, [sprints]);
+  const halfGroups    = useMemo(() => { const g = []; for (const sp of sprints) { const mo = new Date(sp.start+"T12:00:00Z").getUTCMonth(), yr = new Date(sp.start+"T12:00:00Z").getUTCFullYear(), h = `H${mo<6?1:2} ${yr}`; const last = g[g.length-1]; last?.label === h ? last.count++ : g.push({ label: h, count: 1 }); } return g; }, [sprints]);
+
+  const regen = () => setSprints(genSprints(genStart, genN));
+
+  const today         = new Date().toISOString().slice(0, 10);
+  const currentSprint = sprints.find(s => s.start <= today && s.end >= today);
+
+  const addProj   = () => setProjects(p => [...p, { id: uid(), name: "New project", start: sprints[0]?.start||genStart, end: sprints[sprints.length-1]?.end||genStart, ragOverride: null, epics: [] }]);
+  const updProj   = (id, u) => setProjects(p => p.map(x => x.id===id?{...x,...u}:x));
+  const delProj   = (id) => { setProjects(p => p.filter(x => x.id!==id)); setAsn(a => a.filter(x => x.projectId!==id)); };
+  const addEpic   = (projId) => setProjects(p => p.map(x => x.id===projId?{...x,epics:[...(x.epics||[]),{id:uid(),name:"New epic",start:null,end:null,points:null}]}:x));
+  const updEpic   = (projId, epicId, u) => setProjects(p => p.map(x => x.id===projId?{...x,epics:x.epics.map(e=>e.id===epicId?{...e,...u}:e)}:x));
+  const delEpic   = (projId, epicId) => setProjects(p => p.map(x => x.id===projId?{...x,epics:x.epics.filter(e=>e.id!==epicId)}:x));
+  const moveEpic  = (epicId, fromId, toId) => { if(fromId===toId) return; let epic; setProjects(p => p.map(x => { if(x.id===fromId){epic=x.epics.find(e=>e.id===epicId);return{...x,epics:x.epics.filter(e=>e.id!==epicId)};} if(x.id===toId&&epic) return{...x,epics:[...x.epics,epic]}; return x; })); };
+  const addEvt    = () => setEvents(e => [...e, { id: uid(), name: "New event", start: today, end: today, impact: 0 }]);
+  const updEvt    = (id, u) => setEvents(e => e.map(x => x.id===id?{...x,...u}:x));
+  const delEvt    = (id) => setEvents(e => e.filter(x => x.id!==id));
+  const addAsn    = (personId, projectId, fromSprintId, pct=50) => setAsn(a => [...a, { id: uid(), personId, projectId, pct, fromSprintId: fromSprintId||sprints[0]?.id }]);
+  const updAsn    = (id, u) => setAsn(a => a.map(x => x.id===id?{...x,...u}:x));
+  const delAsn    = (id) => setAsn(a => a.filter(x => x.id!==id));
+  const updTeam   = (id, u) => setTeam(t => t.map(x => x.id===id?{...x,...u}:x));
+  const addTeam   = (name, velocity) => setTeam(t => [...t, { id: uid(), name, velocity }]);
+  const delTeam   = (id) => { setTeam(t => t.filter(x => x.id!==id)); setAsn(a => a.filter(x => x.personId!==id)); };
+  const setCapOv     = (pid, sid, v) => setCapOvState(o => ({...o,[`${pid}|${sid}`]:v}));
+  const setCapReason = (pid, sid, r) => setCapReasons(o => ({...o,[`${pid}|${sid}`]:r}));
+  const updSprint = (id, u) => setSprints(s => s.map(x => x.id===id?{...x,...u}:x));
+  const addSprint = () => { const last=sprints[sprints.length-1]; const start=last?addDays(last.end,3):genStart; setSprints(s=>[...s,{id:uid(),label:`S${s.length+1}`,start,end:addDays(start,11)}]); };
+  const delSprint = (id) => setSprints(s => s.filter(x => x.id!==id));
+  const onImport  = (d) => { if(d.team) setTeam(d.team); if(d.projects) setProjects(d.projects); if(d.events) setEvents(d.events); if(d.assignments) setAsn(d.assignments); if(d.capOv) setCapOvState(d.capOv); if(d.capReasons) setCapReasons(d.capReasons); if(d.sprints) setSprints(d.sprints); if(d.genStart) setGenStart(d.genStart); if(d.genN) setGenN(d.genN); };
+
+  if (!loaded) return <div className="p-8 text-gray-400 text-sm">Loading...</div>;
+  const TABS = ["gantt","capacity","assignments","team","events","sprints","data"];
+
+  return (
+    <div className="min-h-screen bg-gray-50" style={{ fontFamily:"system-ui,sans-serif" }}>
+      <div className="bg-white border-b px-5 py-3 flex items-end justify-between gap-4">
+        <div className="flex items-end gap-4">
+          <div>
+            <h1 className="text-lg font-bold text-gray-800">Capacity Planner</h1>
+            <p className="text-xs text-gray-400">{team.length} people · {sprints.length} sprints</p>
+          </div>
+          {currentSprint ? (
+            <div className="bg-blue-600 text-white rounded-lg px-3 py-1.5 text-sm flex items-center gap-2 mb-0.5">
+              <span className="text-blue-200 text-xs">Current sprint</span>
+              <span className="font-bold">{currentSprint.label}</span>
+              <span className="text-blue-200 text-xs">{fmtDate(currentSprint.start)} → {fmtDate(currentSprint.end)}</span>
+            </div>
+          ) : (
+            <div className="bg-gray-100 text-gray-500 rounded-lg px-3 py-1.5 text-xs mb-0.5">No active sprint today</div>
+          )}
+        </div>
+      </div>
+      <div className="bg-white border-b px-5 flex gap-0.5 pt-2 flex-wrap">
+        {TABS.map(t => (
+          <button key={t} onClick={() => setTab(t)} className={`px-4 py-2 text-sm rounded-t transition-colors ${tab===t?"bg-blue-50 text-blue-700 border-b-2 border-blue-600 font-medium":"text-gray-500 hover:text-gray-700"}`}>
+            {t.charAt(0).toUpperCase()+t.slice(1)}
+          </button>
+        ))}
+      </div>
+      <div className="p-5">
+        {tab==="gantt"       && <GanttView      sprints={sprints} projects={projects} events={events} expanded={expanded} setExpanded={setExpanded} monthGroups={monthGroups} quarterGroups={quarterGroups} halfGroups={halfGroups} rag={rag} updProj={updProj} delProj={delProj} addProj={addProj} projPts={projPts} addEpic={addEpic} updEpic={updEpic} delEpic={delEpic} moveEpic={moveEpic} today={today} />}
+        {tab==="capacity"    && <CapacityView   sprints={sprints} team={team} events={events} effCap={effCap} pPts={pPts} teamPts={teamPts} />}
+        {tab==="assignments" && <AssignView     team={team} projects={projects} assignments={assignments} sprints={sprints} addAsn={addAsn} updAsn={updAsn} delAsn={delAsn} activeAlloc={activeAlloc} currentSprint={currentSprint||sprints[0]} />}
+        {tab==="team"        && <TeamView       team={team} updTeam={updTeam} addTeam={addTeam} delTeam={delTeam} sprints={sprints} capOv={capOv} setCapOv={setCapOv} capReasons={capReasons} setCapReason={setCapReason} effCap={effCap} currentSprintId={currentSprint?.id||sprints[0]?.id} />}
+        {tab==="events"      && <EventsView     events={events} addEvt={addEvt} updEvt={updEvt} delEvt={delEvt} />}
+        {tab==="sprints"     && <SprintsView    sprints={sprints} genStart={genStart} genN={genN} setGenStart={setGenStart} setGenN={setGenN} regen={regen} updSprint={updSprint} addSprint={addSprint} delSprint={delSprint} />}
+        {tab==="data"        && <DataView       team={team} projects={projects} events={events} assignments={assignments} capOv={capOv} capReasons={capReasons} sprints={sprints} genStart={genStart} genN={genN} onImport={onImport} />}
+      </div>
+    </div>
+  );
+}
+
+// ── Gantt ──────────────────────────────────────────────────────────────────────
+function GanttView({ sprints, projects, events, expanded, setExpanded, monthGroups, quarterGroups, halfGroups, rag, updProj, delProj, addProj, projPts, addEpic, updEpic, delEpic, moveEpic, today }) {
+  const CW = 90, LW = 300;
+  const [editProj, setEditProj] = useState(null);
+  const [editEpic, setEditEpic] = useState(null);
+  const activeProj       = editProj ? projects.find(p => p.id === editProj) : null;
+  const activeEpicProjId = editEpic ? editEpic.split(":")[0] : null;
+  const activeEpicId     = editEpic ? editEpic.split(":")[1] : null;
+  const activeEpic       = activeEpicProjId ? projects.find(p => p.id === activeEpicProjId)?.epics?.find(e => e.id === activeEpicId) : null;
+
+  return (
+    <div>
+      <div className="flex justify-between items-center mb-3">
+        <h2 className="font-semibold text-gray-700 text-sm">Gantt view</h2>
+        <button onClick={addProj} className="bg-blue-600 text-white px-3 py-1.5 rounded text-sm hover:bg-blue-700">+ Add project</button>
+      </div>
+      <div className="overflow-x-auto rounded-lg border bg-white shadow-sm mb-3">
+        <div style={{ minWidth: LW + sprints.length * CW }}>
+          <div className="flex" style={{ background:"#f8f9fb" }}>
+            <div style={{ width:LW, minWidth:LW, flexShrink:0 }} className="border-r border-b" />
+            <div className="flex-1 flex flex-col">
+              <div className="flex border-b" style={{ background:"#f1f3f7" }}>
+                {halfGroups.map((h,i) => <div key={i} style={{ width:h.count*CW, color:"#9ca3af", letterSpacing:"0.05em" }} className="border-r text-center py-0.5 text-xs font-semibold">{h.label}</div>)}
+              </div>
+              <div className="flex border-b" style={{ background:"#f5f6fa" }}>
+                {quarterGroups.map((q,i) => <div key={i} style={{ width:q.count*CW, color:"#b0b7c3" }} className="border-r text-center py-0.5 text-xs">{q.label}</div>)}
+              </div>
+              <div className="flex border-b" style={{ background:"#f8f9fb" }}>
+                {monthGroups.map((m,i) => <div key={i} style={{ width:m.count*CW, color:"#c4c9d4" }} className="border-r text-center py-0.5 text-xs">{m.label}</div>)}
+              </div>
+            </div>
+          </div>
+          <div className="flex border-b" style={{ background:"#f8f9fb" }}>
+            <div style={{ width:LW, minWidth:LW, flexShrink:0 }} className="border-r" />
+            {sprints.map(sp => { const cur = sp.start<=today&&sp.end>=today; return (
+              <div key={sp.id} style={{ width:CW }} className={`border-r text-center py-1 ${cur?"bg-blue-600":""}`}>
+                <div className={`text-xs font-medium ${cur?"text-white":"text-gray-500"}`}>{sp.label}</div>
+                <div className={`text-xs ${cur?"text-blue-200":"text-gray-300"}`}>{fmtDate(sp.start)}</div>
+              </div>
+            ); })}
+          </div>
+          {projects.length===0 && <div className="px-6 py-8 text-sm text-gray-400 text-center">No projects yet. Add one above.</div>}
+          {projects.map(proj => {
+            const isExp = expanded[proj.id];
+            const sortedEpics = [...(proj.epics||[])].sort((a,b) => { if(!a.start&&!b.start) return 0; if(!a.start) return 1; if(!b.start) return -1; return a.start.localeCompare(b.start); });
+            return (
+              <div key={proj.id}>
+                <div className="flex border-b group" style={{ position:"relative" }}>
+                  {events.map(ev => { let si=-1,ei=-1; sprints.forEach((sp,i)=>{ if(overlaps(ev.start,ev.end,sp.start,sp.end)){if(si<0)si=i;ei=i;} }); if(si<0) return null; return <div key={ev.id} style={{ position:"absolute",top:0,bottom:0,left:LW+si*CW,width:(ei-si+1)*CW,background:"rgba(251,191,36,0.13)",pointerEvents:"none",zIndex:0 }} />; })}
+                  <div style={{ width:LW, minWidth:LW, flexShrink:0, position:"relative", zIndex:1 }} className="border-r px-2 py-2 flex items-center gap-1 bg-white overflow-hidden">
+                    {proj.epics?.length>0 && <button onClick={()=>setExpanded(e=>({...e,[proj.id]:!e[proj.id]}))} className="text-gray-400 hover:text-gray-600 text-xs w-4 flex-shrink-0">{isExp?"▼":"▶"}</button>}
+                    <span title={proj.name} className="text-sm font-medium text-gray-700 flex-1 min-w-0" style={{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{proj.name}</span>
+                    <button onClick={()=>{ setEditProj(editProj===proj.id?null:proj.id); setEditEpic(null); }} className="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-blue-500 flex-shrink-0 px-1"><PencilIcon/></button>
+                    <button onClick={()=>delProj(proj.id)} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 text-xs flex-shrink-0">✕</button>
+                  </div>
+                  {sprints.map(sp => { const r=rag(proj,sp); const pts=r?projPts(proj.id,sp):0; return (
+                    <div key={sp.id} style={{ width:CW, position:"relative", zIndex:1 }} className="border-r flex items-center justify-center py-2">
+                      {r && <div style={{ background:RAG[r], borderRadius:4, width:76, height:24, display:"flex", alignItems:"center", justifyContent:"center", gap:3 }}>
+                        <span className="text-white text-xs font-bold">{r==="green"?"✓":r==="amber"?"~":"!"}</span>
+                        {pts>0 && <span className="text-white text-xs opacity-80">{Math.round(pts)}pt</span>}
+                      </div>}
+                    </div>
+                  ); })}
+                </div>
+                {isExp && sortedEpics.map(ep => (
+                  <EpicRow key={ep.id} ep={ep} epKey={`${proj.id}:${ep.id}`} proj={proj} sprints={sprints} CW={CW} LW={LW} editEpic={editEpic} setEditEpic={setEditEpic} setEditProj={setEditProj} delEpic={delEpic} />
+                ))}
+              </div>
+            );
+          })}
+          <div className="flex items-center gap-5 px-4 py-2 border-t bg-gray-50 text-xs text-gray-500 flex-wrap">
+            <span className="font-medium">Legend</span>
+            <span className="flex items-center gap-1"><span style={{ background:RAG.green, width:10, height:10, borderRadius:2, display:"inline-block" }}/>On track</span>
+            <span className="flex items-center gap-1"><span style={{ background:RAG.amber, width:10, height:10, borderRadius:2, display:"inline-block" }}/>At risk</span>
+            <span className="flex items-center gap-1"><span style={{ background:RAG.red, width:10, height:10, borderRadius:2, display:"inline-block" }}/>Off track</span>
+            <span className="flex items-center gap-1"><span style={{ background:"#bfdbfe", width:10, height:10, borderRadius:2, display:"inline-block" }}/>Epic</span>
+            <span className="flex items-center gap-1"><span style={{ background:"rgba(251,191,36,0.35)", width:10, height:10, borderRadius:2, display:"inline-block" }}/>Event</span>
+            <span className="ml-auto text-gray-400">Hover a row for edit / ✕. Click ▶ to expand epics.</span>
+          </div>
+        </div>
+      </div>
+
+      {activeProj && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg px-4 py-3 mb-3 flex flex-wrap gap-3 items-end" style={{ maxWidth:680 }}>
+          <div className="w-full flex items-center justify-between mb-1">
+            <span className="text-xs font-medium text-blue-700">Editing: <span className="font-semibold">{activeProj.name}</span></span>
+            <button onClick={()=>setEditProj(null)} className="text-xs text-gray-400 hover:text-gray-600">Done</button>
+          </div>
+          <div className="flex-1 min-w-40"><label className="text-xs text-gray-500 block mb-1">Name</label><input className="border rounded px-2 py-1 text-sm w-full" value={activeProj.name} onChange={e=>updProj(activeProj.id,{name:e.target.value})}/></div>
+          <div><label className="text-xs text-gray-500 block mb-1">Start</label><input type="date" className="border rounded px-2 py-1 text-sm" value={activeProj.start||""} onChange={e=>updProj(activeProj.id,{start:e.target.value})}/></div>
+          <div><label className="text-xs text-gray-500 block mb-1">End</label><input type="date" className="border rounded px-2 py-1 text-sm" value={activeProj.end||""} onChange={e=>updProj(activeProj.id,{end:e.target.value})}/></div>
+          <div><label className="text-xs text-gray-500 block mb-1">RAG override</label>
+            <select className="border rounded px-2 py-1 text-sm" value={activeProj.ragOverride||""} onChange={e=>updProj(activeProj.id,{ragOverride:e.target.value||null})}>
+              <option value="">Auto</option><option value="green">🟢 On track</option><option value="amber">🟡 At risk</option><option value="red">🔴 Off track</option>
+            </select>
+          </div>
+          <button onClick={()=>addEpic(activeProj.id)} className="text-blue-600 border border-blue-300 rounded px-2 py-1 text-xs hover:bg-blue-100">+ Epic</button>
+        </div>
+      )}
+
+      {activeEpic && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg px-4 py-3 mb-3 flex flex-wrap gap-3 items-end" style={{ maxWidth:680 }}>
+          <div className="w-full flex items-center justify-between mb-1">
+            <span className="text-xs font-medium text-blue-700">Editing epic: <span className="font-semibold">{activeEpic.name}</span></span>
+            <button onClick={()=>setEditEpic(null)} className="text-xs text-gray-400 hover:text-gray-600">Done</button>
+          </div>
+          <div className="flex-1 min-w-40"><label className="text-xs text-gray-500 block mb-1">Name</label><input className="border rounded px-2 py-1 text-sm w-full" value={activeEpic.name} onChange={e=>updEpic(activeEpicProjId,activeEpicId,{name:e.target.value})}/></div>
+          <div><label className="text-xs text-gray-500 block mb-1">Start</label><input type="date" className="border rounded px-2 py-1 text-sm" value={activeEpic.start||""} onChange={e=>updEpic(activeEpicProjId,activeEpicId,{start:e.target.value})}/></div>
+          <div><label className="text-xs text-gray-500 block mb-1">End</label><input type="date" className="border rounded px-2 py-1 text-sm" value={activeEpic.end||""} onChange={e=>updEpic(activeEpicProjId,activeEpicId,{end:e.target.value})}/></div>
+          <div><label className="text-xs text-gray-500 block mb-1">Move to</label>
+            <select className="border rounded px-2 py-1 text-sm" value={activeEpicProjId} onChange={e=>{ moveEpic(activeEpicId,activeEpicProjId,e.target.value); setEditEpic(null); }}>
+              {projects.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EpicRow({ ep, epKey, proj, sprints, CW, LW, editEpic, setEditEpic, setEditProj, delEpic }) {
+  const [hovered, setHovered] = useState(false);
+  return (
+    <div className="flex border-b" style={{ background:"#f8faff" }} onMouseEnter={()=>setHovered(true)} onMouseLeave={()=>setHovered(false)}>
+      <div style={{ width:LW, minWidth:LW, flexShrink:0 }} className="border-r pl-7 pr-2 py-1.5 flex items-center gap-1.5 overflow-hidden">
+        <span style={{ color:"#93c5fd" }} className="text-xs flex-shrink-0">◆</span>
+        <span title={ep.name} className="text-xs text-gray-600 flex-1 min-w-0" style={{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{ep.name}</span>
+        {ep.points && <span className="text-gray-300 text-xs flex-shrink-0">{ep.points}pt</span>}
+        <button onClick={()=>{ setEditEpic(editEpic===epKey?null:epKey); setEditProj(null); }} style={{ opacity:hovered?1:0, transition:"opacity 0.1s" }} className="text-gray-400 hover:text-blue-500 flex-shrink-0 px-1"><PencilIcon/></button>
+        <button onClick={()=>delEpic(proj.id,ep.id)} style={{ opacity:hovered?1:0, transition:"opacity 0.1s" }} className="text-gray-300 hover:text-red-400 text-xs flex-shrink-0">✕</button>
+      </div>
+      {sprints.map(sp => { const active=overlaps(ep.start||proj.start||"2000",ep.end||proj.end||"2099",sp.start,sp.end); return (
+        <div key={sp.id} style={{ width:CW }} className="border-r flex items-center justify-center py-1.5">
+          {active && <div style={{ background:"#bfdbfe", borderRadius:3, width:72, height:12 }}/>}
+        </div>
+      ); })}
+    </div>
+  );
+}
+
+// ── Capacity ───────────────────────────────────────────────────────────────────
+function CapacityView({ sprints, team, events, effCap, pPts, teamPts }) {
+  return (
+    <div>
+      <h2 className="font-semibold text-gray-700 text-sm mb-4">Capacity overview</h2>
+      <div className="overflow-x-auto rounded-lg border bg-white shadow-sm">
+        <table className="text-sm w-full">
+          <thead><tr className="bg-gray-50 border-b">
+            <th className="text-left px-4 py-2 font-medium text-gray-600" style={{ minWidth:110 }}>Person</th>
+            <th className="text-center px-2 py-2 text-xs font-medium text-gray-500" style={{ minWidth:60 }}>Velocity</th>
+            {sprints.map(sp=><th key={sp.id} className="text-center px-1 py-2 text-xs font-medium text-gray-500" style={{ minWidth:72 }}>{sp.label}</th>)}
+          </tr></thead>
+          <tbody>
+            {team.map(p=>(
+              <tr key={p.id} className="border-b hover:bg-gray-50">
+                <td className="px-4 py-2 font-medium text-gray-700">{p.name}</td>
+                <td className="text-center px-2 py-2 text-xs text-gray-400">{p.velocity}pt</td>
+                {sprints.map(sp=>{ const cap=effCap(p.id,sp); const pts=pPts(p.id,sp); const dim=cap<65; return (
+                  <td key={sp.id} className="text-center px-1 py-2">
+                    <div className={`text-sm font-semibold ${dim?"text-amber-600":"text-gray-700"}`}>{pts}</div>
+                    <div className={`text-xs ${dim?"text-amber-400":"text-gray-300"}`}>{cap}%</div>
+                  </td>
+                ); })}
+              </tr>
+            ))}
+            <tr className="border-t-2" style={{ borderColor:"#bfdbfe", background:"#eff6ff" }}>
+              <td className="px-4 py-2 font-bold text-blue-700">Team total</td>
+              <td className="text-center px-2 py-2 text-xs text-blue-400">{team.reduce((s,p)=>s+p.velocity,0)}pt</td>
+              {sprints.map(sp=><td key={sp.id} className="text-center px-1 py-2"><div className="text-sm font-bold text-blue-700">{Math.round(teamPts(sp))}</div><div className="text-xs text-blue-400">pts</div></td>)}
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p className="text-xs text-gray-400 mt-2">Points = velocity × effective capacity. Amber = reduced by events.</p>
+      {events.length>0 && <div className="mt-4 flex flex-wrap gap-2">{events.map(ev=><div key={ev.id} className="bg-amber-50 border border-amber-200 rounded px-3 py-1.5 text-xs"><span className="font-medium">{ev.name}</span><span className="text-gray-500 ml-2">{fmtDate(ev.start)} → {fmtDate(ev.end)}</span><span className="text-amber-700 ml-2">{ev.impact}% reduction</span></div>)}</div>}
+    </div>
+  );
+}
+
+// ── Assignments ────────────────────────────────────────────────────────────────
+function AssignView({ team, projects, assignments, sprints, addAsn, updAsn, delAsn, activeAlloc, currentSprint }) {
+  const [viewSprint, setViewSprint] = useState(currentSprint?.id||sprints[0]?.id||"");
+  const [addingFor, setAddingFor]   = useState(null);
+  const [newProject, setNewProject] = useState(projects[0]?.id||"");
+
+  const byPerson = useMemo(() => {
+    const map = {};
+    for (const p of team) { map[p.id] = { person: p, projects: {} }; }
+    for (const a of assignments) {
+      if (!map[a.personId]) continue;
+      if (!map[a.personId].projects[a.projectId]) map[a.personId].projects[a.projectId] = [];
+      map[a.personId].projects[a.projectId].push(a);
+    }
+    for (const pid of Object.keys(map)) {
+      for (const projId of Object.keys(map[pid].projects)) {
+        map[pid].projects[projId].sort((a, b) => {
+          const ai = sprints.findIndex(s => s.id === (a.fromSprintId || sprints[0]?.id));
+          const bi = sprints.findIndex(s => s.id === (b.fromSprintId || sprints[0]?.id));
+          return ai - bi;
+        });
+      }
+    }
+    return map;
+  }, [team, assignments, sprints]);
+
+  const vsp = sprints.find(s => s.id === viewSprint) || sprints[0];
+  const allocChips = useMemo(() => {
+    if (!vsp) return {};
+    const map = {};
+    for (const p of team) { map[p.id] = projects.reduce((s, proj) => s + activeAlloc(p.id, proj.id, vsp), 0); }
+    return map;
+  }, [team, projects, vsp, activeAlloc]);
+
+  const firstAvailable = (personId) => {
+    const assignedIds = new Set(assignments.filter(a => a.personId === personId).map(a => a.projectId));
+    return projects.find(pr => !assignedIds.has(pr.id))?.id || projects[0]?.id || "";
+  };
+
+  const openAddFor = (personId) => {
+    if (addingFor?.personId === personId) { setAddingFor(null); return; }
+    setNewProject(firstAvailable(personId));
+    setAddingFor({ personId });
+  };
+
+  return (
+    <div>
+      <div className="mb-4"><h2 className="font-semibold text-gray-700 text-sm">Assignments</h2><p className="text-xs text-gray-400 mt-0.5">Each entry shows when an allocation starts. The most recent entry before a given sprint is used.</p></div>
+      <div className="bg-gray-50 border border-gray-200 rounded-lg px-4 py-3 mb-5">
+        <div className="flex items-center gap-3 mb-3 flex-wrap">
+          <p className="text-xs font-medium text-gray-600">Allocation check for</p>
+          <select value={viewSprint} onChange={e=>setViewSprint(e.target.value)} className="border rounded px-2 py-1 text-xs bg-white">{sprints.map(s=><option key={s.id} value={s.id}>{s.label} ({fmtDate(s.start)})</option>)}</select>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {team.map(p => { const total=allocChips[p.id]??0; const over=total>100; const under=total<80&&total>0; const none=total===0; return (
+            <div key={p.id} className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs ${over?"bg-red-50 border-red-200":under?"bg-amber-50 border-amber-200":none?"bg-gray-100 border-gray-200":"bg-green-50 border-green-200"}`}>
+              <span className={`font-medium ${over?"text-red-700":under?"text-amber-700":none?"text-gray-400":"text-green-700"}`}>{p.name}</span>
+              <span className={`font-bold ${over?"text-red-600":under?"text-amber-600":none?"text-gray-400":"text-green-600"}`}>{total}%</span>
+              <span className={over?"text-red-400":under?"text-amber-400":none?"text-gray-400":"text-green-400"}>{over?"↑ over":none?"unassigned":under?"↓ under":"✓"}</span>
+            </div>
+          ); })}
+        </div>
+      </div>
+      {team.map(p => {
+        const projMap = byPerson[p.id]?.projects || {};
+        const assignedProjects = Object.keys(projMap);
+        const availableProjects = projects.filter(pr => !assignedProjects.includes(pr.id));
+        return (
+          <div key={p.id} className="mb-4 bg-white rounded-lg border overflow-hidden">
+            <div className="px-4 py-2.5 bg-gray-50 border-b flex items-center justify-between">
+              <span className="font-medium text-sm text-gray-700">{p.name}</span>
+              {availableProjects.length > 0 && <button onClick={()=>openAddFor(p.id)} className="text-xs text-blue-500 hover:text-blue-700">+ Add project</button>}
+            </div>
+            {assignedProjects.length===0 && !(addingFor?.personId===p.id) && <div className="px-4 py-3 text-xs text-gray-400">No assignments yet.</div>}
+            {assignedProjects.map(projId => {
+              const proj = projects.find(x => x.id === projId);
+              if (!proj) return null;
+              const periods = projMap[projId];
+              return (
+                <div key={projId} className="border-b last:border-b-0 px-4 py-2.5 flex items-start gap-3 flex-wrap">
+                  <span title={proj.name} className="text-sm text-gray-600 flex-shrink-0 pt-0.5" style={{ width:200, minWidth:200, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{proj.name}</span>
+                  <div className="flex flex-wrap gap-1.5 flex-1 items-center">
+                    {periods.map((a,i) => <PeriodChip key={a.id} a={a} sprints={sprints} isLast={i===periods.length-1} onUpdate={u=>updAsn(a.id,u)} onDelete={()=>delAsn(a.id)}/>)}
+                    <button onClick={()=>{ const last=periods[periods.length-1]; const lastIdx=sprints.findIndex(s=>s.id===(last?.fromSprintId||sprints[0]?.id)); const next=sprints[lastIdx+1]||sprints[lastIdx]; addAsn(p.id,projId,next?.id); }} className="text-xs text-blue-400 hover:text-blue-600 border border-blue-200 rounded px-2 py-0.5 hover:bg-blue-50">+ Period</button>
+                  </div>
+                </div>
+              );
+            })}
+            {addingFor?.personId===p.id && (
+              <div className="border-t px-4 py-2.5 flex items-center gap-2 flex-wrap bg-blue-50">
+                <span className="text-xs text-gray-500">Project</span>
+                <select value={newProject} onChange={e=>setNewProject(e.target.value)} className="border rounded px-2 py-1 text-xs bg-white">
+                  {availableProjects.map(pr=><option key={pr.id} value={pr.id}>{pr.name}</option>)}
+                </select>
+                <span className="text-xs text-gray-500">from</span>
+                <select defaultValue={sprints[0]?.id} id={`from-${p.id}`} className="border rounded px-2 py-1 text-xs bg-white">
+                  {sprints.map(s=><option key={s.id} value={s.id}>{s.label} ({fmtDate(s.start)})</option>)}
+                </select>
+                <span className="text-xs text-gray-500">at</span>
+                <input type="number" min={0} max={100} defaultValue={50} id={`pct-${p.id}`} className="border rounded px-2 py-1 text-xs w-16 text-center bg-white"/>
+                <span className="text-xs text-gray-500">%</span>
+                <button onClick={()=>{ const sel=document.getElementById(`from-${p.id}`); const pct=+document.getElementById(`pct-${p.id}`).value||50; addAsn(p.id,newProject,sel?.value||sprints[0]?.id,pct); setAddingFor(null); }} className="bg-blue-600 text-white px-2 py-1 rounded text-xs hover:bg-blue-700">Add</button>
+                <button onClick={()=>setAddingFor(null)} className="text-gray-400 text-xs hover:text-gray-600">Cancel</button>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function PeriodChip({ a, sprints, isLast, onUpdate, onDelete }) {
+  const [editing, setEditing] = useState(false);
+  const [hovered, setHovered] = useState(false);
+  const [dPct, setDPct]       = useState(a.pct);
+  const [dFrom, setDFrom]     = useState(a.fromSprintId||sprints[0]?.id);
+  const spLabel = sprints.find(s=>s.id===(a.fromSprintId||sprints[0]?.id))?.label||"S?";
+  if (editing) return (
+    <div className="flex items-center gap-1.5 bg-blue-50 border border-blue-200 rounded-lg px-2 py-1 text-xs flex-wrap">
+      <span className="text-gray-500">from</span>
+      <select value={dFrom} onChange={e=>setDFrom(e.target.value)} className="border rounded px-1 py-0.5 text-xs bg-white">{sprints.map(s=><option key={s.id} value={s.id}>{s.label} ({fmtDate(s.start)})</option>)}</select>
+      <input type="number" min={0} max={100} value={dPct} onChange={e=>setDPct(+e.target.value)} className="border rounded px-1 py-0.5 text-xs text-center w-14"/>
+      <span className="text-gray-400">%</span>
+      <button onClick={()=>{onUpdate({pct:dPct,fromSprintId:dFrom});setEditing(false);}} className="text-blue-600 hover:text-blue-800 font-medium">✓</button>
+      <button onClick={()=>setEditing(false)} className="text-gray-400">✕</button>
+    </div>
+  );
+  return (
+    <div onMouseEnter={()=>setHovered(true)} onMouseLeave={()=>setHovered(false)} onClick={()=>setEditing(true)}
+      className="flex items-center gap-1 bg-gray-100 border border-transparent rounded-lg px-2.5 py-1 text-xs hover:bg-blue-50 hover:border-blue-200 cursor-pointer transition-colors">
+      <span className="text-gray-400">from {spLabel}</span>
+      <span className="font-semibold text-gray-700 ml-1">{a.pct}%</span>
+      {!isLast && <span className="text-gray-300 ml-1">→</span>}
+      <button onClick={e=>{e.stopPropagation();onDelete();}} style={{ opacity:hovered?1:0, transition:"opacity 0.1s" }} className="text-gray-300 hover:text-red-400 ml-1 text-xs">✕</button>
+    </div>
+  );
+}
+
+// ── Team ───────────────────────────────────────────────────────────────────────
+function TeamView({ team, updTeam, addTeam, delTeam, sprints, capOv, setCapOv, capReasons, setCapReason, effCap, currentSprintId }) {
+  const [newName, setNewName]   = useState("");
+  const [newVel, setNewVel]     = useState(8);
+  const [showHelp, setShowHelp] = useState(false);
+  const [qPerson, setQPerson]   = useState(team[0]?.id||"");
+  const [qSprint, setQSprint]   = useState(currentSprintId||sprints[0]?.id||"");
+  const [qDays, setQDays]       = useState(1);
+  const [qReason, setQReason]   = useState("PTO");
+  const [qCustom, setQCustom]   = useState("");
+
+  const submitNew  = () => { if(!newName.trim()) return; addTeam(newName.trim(),newVel); setNewName(""); setNewVel(8); };
+  const sprintDays = useMemo(()=>{ const sp=sprints.find(s=>s.id===qSprint); if(!sp) return 10; return countBusinessDays(sp.start,sp.end); },[sprints,qSprint]);
+  const currentBase = capOv[`${qPerson}|${qSprint}`]??100;
+  const newCap     = Math.max(0,Math.round(currentBase-(qDays/sprintDays)*100));
+  const apply      = () => { setCapOv(qPerson,qSprint,newCap); setCapReason(qPerson,qSprint,qReason==="Other"?(qCustom.trim()||"Other"):qReason); };
+  const logEntries = useMemo(()=>{ const out=[]; for(const key of Object.keys(capOv)){ const val=capOv[key]; if(val===100) continue; const [pid,sid]=key.split("|"); const person=team.find(p=>p.id===pid); const sprint=sprints.find(s=>s.id===sid); if(!person||!sprint) continue; out.push({key,pid,sid,person:person.name,sprint:sprint.label,sprintStart:sprint.start,override:val,eff:effCap(pid,sprint),reason:capReasons[key]||null}); } return out.sort((a,b)=>a.sprintStart.localeCompare(b.sprintStart)); },[capOv,capReasons,team,sprints,effCap]);
+
+  return (
+    <div>
+      <h2 className="font-semibold text-gray-700 text-sm mb-4">Team velocity and capacity overrides</h2>
+      <div className="grid gap-2 mb-3" style={{ maxWidth:520, gridTemplateColumns:"1fr 1fr" }}>
+        {team.map(p=>(
+          <div key={p.id} className="bg-white rounded-lg border p-3 flex items-center gap-2 group">
+            <input className="font-medium text-gray-700 text-sm w-24 border-b border-transparent hover:border-blue-200 focus:border-blue-400 outline-none bg-transparent" value={p.name} onChange={e=>updTeam(p.id,{name:e.target.value})}/>
+            <input type="number" min={1} max={30} value={p.velocity} onChange={e=>updTeam(p.id,{velocity:+e.target.value})} className="border rounded px-2 py-1 text-sm w-14 text-center ml-auto"/>
+            <span className="text-xs text-gray-400">pt</span>
+            <button onClick={()=>delTeam(p.id)} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 text-xs ml-1">✕</button>
+          </div>
+        ))}
+      </div>
+      <div className="flex items-center gap-2 mb-6 max-w-sm">
+        <input className="border rounded px-2 py-1.5 text-sm flex-1" placeholder="New person's name" value={newName} onChange={e=>setNewName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submitNew()}/>
+        <input type="number" min={1} max={30} value={newVel} onChange={e=>setNewVel(+e.target.value)} className="border rounded px-2 py-1.5 text-sm w-16 text-center"/>
+        <span className="text-xs text-gray-400">pt</span>
+        <button onClick={submitNew} className="bg-blue-600 text-white px-3 py-1.5 rounded text-sm hover:bg-blue-700">Add</button>
+      </div>
+      <h3 className="font-medium text-gray-600 text-sm mb-1">Per-sprint capacity overrides (%)</h3>
+      <div className="flex items-center gap-2 mb-3">
+        <p className="text-xs text-gray-400">Set below 100 for PTO, part-time weeks, etc. Events reduce capacity further on top of this.</p>
+        <button onClick={()=>setShowHelp(h=>!h)} className="text-xs text-blue-400 hover:text-blue-600 flex-shrink-0 whitespace-nowrap">{showHelp?"Hide":"How does this work?"}</button>
+      </div>
+      {showHelp && <div className="bg-blue-50 border border-blue-100 rounded-lg px-4 py-3 mb-4 text-xs text-blue-800 leading-relaxed max-w-2xl"><p className="mb-1"><span className="font-semibold">Override %</span> is your baseline for a person in a sprint — PTO, joining mid-sprint, or a reduced workweek.</p><p className="mb-1"><span className="font-semibold">Effective capacity</span> is the override reduced further by any events overlapping that sprint.</p><p>You only need to set overrides for things that affect individuals differently — events apply to everyone automatically.</p></div>}
+      <div className="bg-gray-50 border border-gray-200 rounded-lg px-4 py-3 mb-4">
+        <p className="text-xs font-medium text-gray-600 mb-3">Quick capacity deduct</p>
+        <div className="flex items-end gap-3 flex-wrap">
+          <div><label className="text-xs text-gray-500 block mb-1">Person</label><select value={qPerson} onChange={e=>setQPerson(e.target.value)} className="border rounded px-2 py-1.5 text-sm bg-white">{team.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></div>
+          <div><label className="text-xs text-gray-500 block mb-1">Sprint</label><select value={qSprint} onChange={e=>setQSprint(e.target.value)} className="border rounded px-2 py-1.5 text-sm bg-white">{sprints.map(s=><option key={s.id} value={s.id}>{s.label} ({fmtDate(s.start)})</option>)}</select></div>
+          <div><label className="text-xs text-gray-500 block mb-1">Days off</label><input type="number" min={0.5} max={sprintDays} step={0.5} value={qDays} onChange={e=>setQDays(+e.target.value)} className="border rounded px-2 py-1.5 text-sm w-20 text-center bg-white"/></div>
+          <div><label className="text-xs text-gray-500 block mb-1">Reason</label><select value={qReason} onChange={e=>setQReason(e.target.value)} className="border rounded px-2 py-1.5 text-sm bg-white">{REASONS.map(r=><option key={r} value={r}>{r}</option>)}</select></div>
+          {qReason==="Other" && <div><label className="text-xs text-gray-500 block mb-1">Specify</label><input className="border rounded px-2 py-1.5 text-sm w-28 bg-white" placeholder="e.g. conference" value={qCustom} onChange={e=>setQCustom(e.target.value)}/></div>}
+          <div className="text-sm text-gray-700 pb-1.5">{currentBase}% → <span className="font-bold">{newCap}%</span><span className="text-xs text-gray-400 ml-1">({sprintDays}-day sprint)</span></div>
+          <button onClick={apply} className="bg-blue-600 text-white px-3 py-1.5 rounded text-sm hover:bg-blue-700">Apply</button>
+        </div>
+      </div>
+      <div className="overflow-x-auto rounded-lg border bg-white shadow-sm">
+        <table className="text-sm w-full">
+          <thead><tr className="bg-gray-50 border-b"><th className="text-left px-4 py-2 font-medium text-gray-600" style={{ minWidth:110 }}>Person</th>{sprints.map(sp=><th key={sp.id} className="text-center px-1 py-2 text-xs font-medium text-gray-500" style={{ width:72 }}>{sp.label}</th>)}</tr></thead>
+          <tbody>
+            {team.map(p=>(
+              <tr key={p.id} className="border-b">
+                <td className="px-4 py-2 font-medium text-gray-700">{p.name}</td>
+                {sprints.map(sp=>{ const key=`${p.id}|${sp.id}`; const base=capOv[key]??100; const eff=effCap(p.id,sp); const reduced=eff<base; const hasNote=base!==100&&capReasons[key]; return (
+                  <td key={sp.id} className="px-1 py-1 text-center">
+                    <div className="relative inline-block">
+                      <input type="number" min={0} max={100} value={base} onChange={e=>setCapOv(p.id,sp.id,+e.target.value)} className={`border rounded text-xs text-center w-14 py-0.5 ${reduced?"border-amber-300 bg-amber-50":""}`}/>
+                      {hasNote && <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-blue-400 block"/>}
+                    </div>
+                    <div title={`${capReasons[key]?capReasons[key]+" · ":""}Override: ${base}%${reduced?` · Effective after events: ${eff}%`:""}`} className={`text-xs mt-0.5 cursor-help ${reduced?"text-amber-500":"text-gray-300"}`}>→ {eff}%</div>
+                  </td>
+                ); })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="text-xs text-gray-400 mt-1">Amber = effective capacity reduced by events. Blue dot = reason logged. Hover arrow for details.</p>
+      {logEntries.length>0 && (
+        <div className="mt-6">
+          <h3 className="font-medium text-gray-600 text-sm mb-3">Deductions log</h3>
+          <div className="rounded-lg border bg-white shadow-sm overflow-hidden">
+            <table className="text-sm w-full">
+              <thead><tr className="bg-gray-50 border-b"><th className="text-left px-4 py-2 text-xs font-medium text-gray-500">Person</th><th className="text-left px-4 py-2 text-xs font-medium text-gray-500">Sprint</th><th className="text-center px-4 py-2 text-xs font-medium text-gray-500">Override</th><th className="text-center px-4 py-2 text-xs font-medium text-gray-500">Effective</th><th className="text-left px-4 py-2 text-xs font-medium text-gray-500">Reason</th><th className="px-4 py-2"/></tr></thead>
+              <tbody>{logEntries.map(e=><LogRow key={e.key} entry={e} reasons={REASONS} onSave={(ov,r)=>{setCapOv(e.pid,e.sid,ov);setCapReason(e.pid,e.sid,r);}} onDelete={()=>{setCapOv(e.pid,e.sid,100);setCapReason(e.pid,e.sid,null);}}/>)}</tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LogRow({ entry: e, reasons, onSave, onDelete }) {
+  const [editing, setEditing]     = useState(false);
+  const [dOverride, setDOverride] = useState(e.override);
+  const [dReason, setDReason]     = useState(e.reason||"PTO");
+  const [dCustom, setDCustom]     = useState("");
+  const save = () => { onSave(Math.min(100,Math.max(0,dOverride)),dReason==="Other"?(dCustom.trim()||"Other"):dReason); setEditing(false); };
+  if (editing) return (
+    <tr className="border-b bg-blue-50">
+      <td className="px-4 py-2 font-medium text-gray-700">{e.person}</td>
+      <td className="px-4 py-2 text-gray-600">{e.sprint} <span className="text-gray-400 text-xs">({fmtDate(e.sprintStart)})</span></td>
+      <td className="px-4 py-2 text-center"><input type="number" min={0} max={100} value={dOverride} onChange={ev=>setDOverride(+ev.target.value)} className="border rounded px-2 py-0.5 text-xs text-center w-16"/></td>
+      <td className="px-4 py-2 text-center text-gray-400 text-xs">—</td>
+      <td className="px-4 py-2 flex items-center gap-2 flex-wrap">
+        <select value={dReason} onChange={ev=>setDReason(ev.target.value)} className="border rounded px-2 py-0.5 text-xs bg-white">{reasons.map(r=><option key={r} value={r}>{r}</option>)}</select>
+        {dReason==="Other" && <input className="border rounded px-2 py-0.5 text-xs w-24" placeholder="specify" value={dCustom} onChange={ev=>setDCustom(ev.target.value)}/>}
+      </td>
+      <td className="px-4 py-2 text-right whitespace-nowrap"><button onClick={save} className="text-blue-600 text-xs mr-2">Save</button><button onClick={()=>setEditing(false)} className="text-gray-400 text-xs">Cancel</button></td>
+    </tr>
+  );
+  return (
+    <tr className="border-b last:border-0 hover:bg-gray-50 group">
+      <td className="px-4 py-2 font-medium text-gray-700">{e.person}</td>
+      <td className="px-4 py-2 text-gray-600">{e.sprint} <span className="text-gray-400 text-xs">({fmtDate(e.sprintStart)})</span></td>
+      <td className="px-4 py-2 text-center text-gray-600">{e.override}%</td>
+      <td className="px-4 py-2 text-center"><span className={e.eff<e.override?"text-amber-600 font-medium":"text-gray-600"}>{e.eff}%</span></td>
+      <td className="px-4 py-2">{e.reason?<span className="bg-blue-50 text-blue-700 text-xs px-2 py-0.5 rounded-full">{e.reason}</span>:<span className="text-gray-300 text-xs">—</span>}</td>
+      <td className="px-4 py-2 text-right whitespace-nowrap">
+        <button onClick={()=>{setDOverride(e.override);setDReason(e.reason||"PTO");setDCustom("");setEditing(true);}} className="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-blue-500 mr-2"><PencilIcon/></button>
+        <button onClick={onDelete} className="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 text-xs">✕</button>
+      </td>
+    </tr>
+  );
+}
+
+// ── Events ─────────────────────────────────────────────────────────────────────
+function EventsView({ events, addEvt, updEvt, delEvt }) {
+  const [impactDraft, setImpactDraft] = useState({});
+  const today = new Date().toISOString().slice(0,10);
+  return (
+    <div>
+      <div className="flex justify-between items-center mb-3">
+        <div><h2 className="font-semibold text-gray-700 text-sm">Events</h2><p className="text-xs text-gray-400 mt-0.5">Events reduce team capacity for any sprints they overlap with</p></div>
+        <button onClick={addEvt} className="bg-blue-600 text-white px-3 py-1.5 rounded text-sm hover:bg-blue-700">+ Add event</button>
+      </div>
+      {events.length===0 && <p className="text-sm text-gray-400 text-center py-8">No events yet.</p>}
+      <div className="grid gap-3">
+        {events.map(ev=>(
+          <div key={ev.id} className="bg-white rounded-lg border p-4 flex items-end gap-4 flex-wrap">
+            <div className="flex-1 min-w-32"><label className="text-xs text-gray-400 block mb-1">Event name</label><input className="border rounded px-2 py-1.5 text-sm w-full" value={ev.name} onChange={e=>updEvt(ev.id,{name:e.target.value})}/></div>
+            <div><label className="text-xs text-gray-400 block mb-1">Start</label><input type="date" className="border rounded px-2 py-1.5 text-sm" value={ev.start} onChange={e=>updEvt(ev.id,{start:e.target.value})}/></div>
+            <div><label className="text-xs text-gray-400 block mb-1">End</label><input type="date" className="border rounded px-2 py-1.5 text-sm" value={ev.end} onChange={e=>updEvt(ev.id,{end:e.target.value})}/></div>
+            <div><label className="text-xs text-gray-400 block mb-1">Capacity impact</label>
+              <div className="flex items-center gap-1">
+                <input type="number" min={0} max={100}
+                  value={impactDraft[ev.id]!==undefined?impactDraft[ev.id]:ev.impact}
+                  onChange={e=>setImpactDraft(d=>({...d,[ev.id]:e.target.value}))}
+                  onBlur={e=>{ const v=Math.min(100,Math.max(0,+e.target.value||0)); updEvt(ev.id,{impact:v}); setImpactDraft(d=>{const n={...d};delete n[ev.id];return n;}); }}
+                  className="border rounded px-2 py-1.5 text-sm w-20 text-center"/>
+                <span className="text-xs text-gray-400">% reduction</span>
+              </div>
+            </div>
+            <button onClick={()=>delEvt(ev.id)} className="text-red-400 hover:text-red-600 text-sm pb-1.5">Delete</button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Sprints ────────────────────────────────────────────────────────────────────
+function SprintsView({ sprints, genStart, genN, setGenStart, setGenN, regen, updSprint, addSprint, delSprint }) {
+  return (
+    <div>
+      <div className="flex justify-between items-center mb-1">
+        <h2 className="font-semibold text-gray-700 text-sm">Sprints</h2>
+        <button onClick={addSprint} className="bg-blue-600 text-white px-3 py-1.5 rounded text-sm hover:bg-blue-700">+ Add sprint</button>
+      </div>
+      <p className="text-xs text-gray-400 mb-4">Edit any sprint's label or dates directly. Sprints run Mon–Fri, two weeks long.</p>
+      <div className="bg-white rounded-lg border shadow-sm overflow-hidden mb-5">
+        <table className="text-sm w-full">
+          <thead><tr className="bg-gray-50 border-b"><th className="text-left px-4 py-2 font-medium text-gray-600">Label</th><th className="text-left px-4 py-2 font-medium text-gray-600">Start</th><th className="text-left px-4 py-2 font-medium text-gray-600">End</th><th className="px-4 py-2"/></tr></thead>
+          <tbody>
+            {sprints.map(sp=>(
+              <tr key={sp.id} className="border-b hover:bg-gray-50">
+                <td className="px-4 py-2"><input className="border rounded px-2 py-1 text-sm w-36" value={sp.label} onChange={e=>updSprint(sp.id,{label:e.target.value})}/></td>
+                <td className="px-4 py-2"><input type="date" className="border rounded px-2 py-1 text-sm" value={sp.start} onChange={e=>updSprint(sp.id,{start:e.target.value})}/></td>
+                <td className="px-4 py-2"><input type="date" className="border rounded px-2 py-1 text-sm" value={sp.end} onChange={e=>updSprint(sp.id,{end:e.target.value})}/></td>
+                <td className="px-4 py-2 text-right"><button onClick={()=>delSprint(sp.id)} className="text-gray-300 hover:text-red-400 text-xs">✕</button></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="bg-amber-50 border border-amber-200 rounded-lg px-4 py-3">
+        <p className="text-xs font-medium text-amber-800 mb-2">Auto-generate sprints — replaces all current sprints</p>
+        <div className="flex items-center gap-3 flex-wrap">
+          <div><label className="text-xs text-amber-700 block mb-1">First sprint start (Monday)</label><input type="date" value={genStart} onChange={e=>setGenStart(e.target.value)} className="border border-amber-300 rounded px-2 py-1 text-sm"/></div>
+          <div><label className="text-xs text-amber-700 block mb-1">Number of sprints</label><input type="number" min={2} max={26} value={genN} onChange={e=>setGenN(+e.target.value)} className="border border-amber-300 rounded px-2 py-1 text-sm w-16"/></div>
+          <button onClick={regen} className="bg-amber-500 text-white px-3 py-1.5 rounded text-sm hover:bg-amber-600 mt-4">Regenerate</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Data ───────────────────────────────────────────────────────────────────────
+function DataView({ team, projects, events, assignments, capOv, capReasons, sprints, genStart, genN, onImport }) {
+  const [exportJson, setExportJson] = useState("");
+  const [importText, setImportText] = useState("");
+  const [importMsg, setImportMsg]   = useState("");
+  const [importErr, setImportErr]   = useState("");
+  const fileRef = useRef();
+
+  const exportData = () => {
+    const data = { team, projects, events, assignments, capOv, capReasons, sprints, genStart, genN };
+    setExportJson(JSON.stringify(data, null, 2));
+    setImportMsg(""); setImportErr("");
+  };
+  const doImport = (jsonStr) => {
+    try {
+      const d = JSON.parse(jsonStr);
+      if (!d.team && !d.projects && !d.sprints) throw new Error("Doesn't look like a valid backup.");
+      onImport(d); setImportMsg("✓ Data imported successfully."); setImportErr(""); setImportText("");
+      setTimeout(() => setImportMsg(""), 4000);
+    } catch(e) { setImportErr("✗ " + e.message); setImportMsg(""); }
+  };
+  const importFile = (e) => { const file=e.target.files?.[0]; if(!file) return; const reader=new FileReader(); reader.onload=ev=>doImport(ev.target.result); reader.readAsText(file); e.target.value=""; };
+
+  const clearAll = () => {
+    if (window.confirm("Clear all data and start fresh? This cannot be undone.")) {
+      localStorage.removeItem(STORAGE_KEY);
+      window.location.reload();
+    }
+  };
+
+  return (
+    <div className="max-w-md">
+      <h2 className="font-semibold text-gray-700 text-sm mb-1">Data</h2>
+      <p className="text-xs text-gray-400 mb-6">Your data is saved automatically in your browser's local storage.</p>
+
+      <div className="bg-white rounded-lg border p-4 mb-4">
+        <h3 className="text-sm font-medium text-gray-600 mb-1">Backup &amp; restore</h3>
+        <p className="text-xs text-gray-400 mb-4">Export your plan as JSON to back it up or share it. Import to restore.</p>
+        <div className="mb-5">
+          <p className="text-xs font-medium text-gray-500 mb-2">Export</p>
+          <button onClick={exportData} className="bg-gray-100 text-gray-700 px-3 py-1.5 rounded text-sm hover:bg-gray-200 border">↓ Show JSON</button>
+          {exportJson && (
+            <div className="mt-2">
+              <textarea id="export-ta" readOnly value={exportJson} rows={5} className="w-full border rounded px-2 py-1.5 text-xs font-mono bg-gray-50 resize-none" onClick={e=>e.target.select()}/>
+              <div className="flex gap-3 mt-1">
+                <button onClick={()=>{const ta=document.getElementById("export-ta");ta.select();document.execCommand("copy");}} className="text-xs text-blue-500 hover:text-blue-700">Copy to clipboard</button>
+                <button onClick={()=>setExportJson("")} className="text-xs text-gray-400 hover:text-gray-600">Dismiss</button>
+              </div>
+            </div>
+          )}
+        </div>
+        <div>
+          <p className="text-xs font-medium text-gray-500 mb-2">Import</p>
+          <button onClick={()=>fileRef.current?.click()} className="bg-gray-100 text-gray-700 px-3 py-1.5 rounded text-sm hover:bg-gray-200 border mb-3">↑ Upload file</button>
+          <input ref={fileRef} type="file" accept=".json" className="hidden" onChange={importFile}/>
+          <p className="text-xs text-gray-400 mb-1">Or paste JSON directly:</p>
+          <textarea value={importText} onChange={e=>setImportText(e.target.value)} rows={5} placeholder="Paste your backup JSON here..." className="w-full border rounded px-2 py-1.5 text-xs font-mono bg-white resize-none mb-2"/>
+          <button onClick={()=>doImport(importText)} disabled={!importText.trim()} className="bg-blue-600 text-white px-3 py-1.5 rounded text-sm hover:bg-blue-700 disabled:opacity-40">Import from text</button>
+          {importMsg && <p className="text-xs text-green-600 mt-2">{importMsg}</p>}
+          {importErr && <p className="text-xs text-red-500 mt-2">{importErr}</p>}
+        </div>
+      </div>
+
+      <div className="bg-white rounded-lg border p-4">
+        <h3 className="text-sm font-medium text-gray-600 mb-1">Reset</h3>
+        <p className="text-xs text-gray-400 mb-3">Clear all data and start from scratch. Export a backup first if needed.</p>
+        <button onClick={clearAll} className="text-red-500 border border-red-200 rounded px-3 py-1.5 text-sm hover:bg-red-50">Clear all data</button>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
