@@ -2,6 +2,8 @@
 
 A lightweight, self-contained sprint capacity planning tool. No build step, no dependencies to install, no backend required. Just open `index.html` in a browser.
 
+Vibe-coded with Claude 🧡
+
 ---
 
 ## Features
