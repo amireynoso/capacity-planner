@@ -34,11 +34,21 @@ function genSprints(start, n) {
 function overlaps(s1, e1, s2, e2) { return !!s1 && !!e1 && !!s2 && !!e2 && s1 <= e2 && s2 <= e1; }
 function fmtDate(d) { return new Date(d + "T12:00:00Z").toLocaleDateString("en-US", { month: "short", day: "numeric" }); }
 function sprintMonth(sp) { return new Date(sp.start + "T12:00:00Z").toLocaleDateString("en-US", { month: "long", year: "numeric" }); }
-function countBusinessDays(start, end) {
+/** Business days (Mon–Fri, UTC) inclusive; no fallback — used for capacity math. */
+function businessDaysInclusive(start, end) {
   let count = 0;
   const d = new Date(start + "T12:00:00Z"), e = new Date(end + "T12:00:00Z");
-  while (d <= e) { const day = d.getUTCDay(); if (day !== 0 && day !== 6) count++; d.setUTCDate(d.getUTCDate() + 1); }
-  return count || 10;
+  if (d > e) return 0;
+  while (d <= e) {
+    const day = d.getUTCDay();
+    if (day !== 0 && day !== 6) count++;
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return count;
+}
+function countBusinessDays(start, end) {
+  const n = businessDaysInclusive(start, end);
+  return n || 10;
 }
 
 const PencilIcon = () => (
@@ -109,14 +119,18 @@ function App() {
 
   const effCap = useCallback((pid, sp) => {
     let cap = capOv[`${pid}|${sp.id}`] ?? 100;
+    const sprintBiz = Math.max(1, businessDaysInclusive(sp.start, sp.end));
+    let totalImpact = 0;
     for (const ev of events) {
-      if (overlaps(ev.start, ev.end, sp.start, sp.end)) {
-        const os = ev.start > sp.start ? ev.start : sp.start;
-        const oe = ev.end < sp.end ? ev.end : sp.end;
-        const days = Math.max(1, (new Date(oe) - new Date(os)) / 86400000 + 1);
-        cap = cap * (1 - Math.min(days / 10, 1) * ev.impact / 100);
-      }
+      if (!overlaps(ev.start, ev.end, sp.start, sp.end)) continue;
+      const os = ev.start > sp.start ? ev.start : sp.start;
+      const oe = ev.end < sp.end ? ev.end : sp.end;
+      const overlapBiz = businessDaysInclusive(os, oe);
+      const fraction = Math.min(overlapBiz / sprintBiz, 1);
+      totalImpact += fraction * ev.impact;
     }
+    totalImpact = Math.min(totalImpact, 100);
+    cap = cap * (1 - totalImpact / 100);
     return Math.round(Math.max(0, cap));
   }, [capOv, events]);
 
